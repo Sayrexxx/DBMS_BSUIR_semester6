@@ -27,7 +27,7 @@
    |-|-|-|-|
    |ID|Number|Primary key|Unique identifier for each record in a database table|
    |Name|Varchar2|NOT NULL and length of the value should be less than 100 characters|Name of the student|
-   |Group_id|Number|Foreign key|References the ID field in the `GROUPS` table, enforcing referential integrity|
+   |Group_id|Number|Foreign key on delete cascade|References the ID field in the `GROUPS` table, enforcing referential integrity|
    
 1. Realize triggers for the tables of task 1 integrity check (check for uniqueness of `ID` fields), autoincremental key generation and uniqueness check for `GROUP.NAME` field.
 1. Implement a trigger that implements foreign key with cascading deletion between the `STUDENTS` and `GROUPS` tables.
