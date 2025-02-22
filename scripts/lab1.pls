@@ -7,8 +7,8 @@ CREATE TABLE MyTable (
 DECLARE
     random_val NUMBER;
 BEGIN
-    FOR i IN 1..10000 LOOP
-        random_val := TRUNC(DBMS_RANDOM.VALUE(1, 100001));  -- TRUNC округляет до целого числа
+    FOR i IN 1..10 LOOP
+        random_val := TRUNC(DBMS_RANDOM.VALUE(1, 100001));
         INSERT INTO MyTable (id, val) VALUES (i, random_val);
     END LOOP;
     COMMIT;
@@ -57,7 +57,7 @@ BEGIN
 END;
 
 
-SELECT GenerateInsertCommand(10) FROM dual;
+SELECT GenerateInsertCommand(-15) FROM dual;
 
 
 
@@ -113,9 +113,9 @@ END;
 BEGIN
     InsertIntoMyTable(128);
     InsertIntoMyTable(593);
-    UpdateMyTable(10001, 12983892193);
-    DeleteFromMyTable(10002);
-    DeleteFromMyTable(10003);
+    UpdateMyTable(11, 12983892193);
+    DeleteFromMyTable(12);
+    DeleteFromMyTable(13);
 END;
 
 
@@ -153,19 +153,4 @@ BEGIN
 END;
 
 
-SELECT CalculateAnnualBonus(5000, 10) FROM dual;
-
-
--- SELECT
---   ORIGINAL_NAME,
---   DROPTIME
--- FROM
---   user_recyclebin
--- WHERE
---   OPERATION = 'DROP'
---   and TYPE = 'TABLE'
--- order by
---   DROPTIME desc;
---
---
--- flashback table MyTable to before drop rename to MyTable;
+SELECT CalculateAnnualBonus(5000, 10.1) FROM dual;
