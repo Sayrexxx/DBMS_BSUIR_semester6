@@ -85,6 +85,22 @@ CREATE TABLE STUDENTS_AUDIT (
     NEW_GROUP_ID NUMBER
 );
 
+CREATE OR REPLACE TRIGGER trg_groups_audit
+AFTER INSERT OR UPDATE OR DELETE ON GROUPS
+FOR EACH ROW
+BEGIN
+    IF INSERTING THEN
+        INSERT INTO GROUPS_AUDIT (ACTION, GROUP_ID, ACTION_TIMESTAMP, NEW_NAME, NEW_C_VAL)
+        VALUES ('INSERT', :NEW.ID, SYSTIMESTAMP, :NEW.NAME, :NEW.C_VAL);
+    ELSIF UPDATING THEN
+        INSERT INTO GROUPS_AUDIT (ACTION, GROUP_ID, ACTION_TIMESTAMP, OLD_NAME, NEW_NAME, OLD_C_VAL, NEW_C_VAL)
+        VALUES ('UPDATE', :OLD.ID, SYSTIMESTAMP, :OLD.NAME, :NEW.NAME, :OLD.C_VAL, :NEW.C_VAL);
+    ELSIF DELETING THEN
+        INSERT INTO GROUPS_AUDIT (ACTION, GROUP_ID, ACTION_TIMESTAMP, OLD_NAME, OLD_C_VAL)
+        VALUES ('DELETE', :OLD.ID, SYSTIMESTAMP, :OLD.NAME, :OLD.C_VAL);
+    END IF;
+END;
+
 CREATE OR REPLACE TRIGGER trg_students_audit
 AFTER INSERT OR UPDATE OR DELETE ON STUDENTS
 FOR EACH ROW
@@ -110,27 +126,48 @@ CREATE TABLE STUDENTS_BACKUP (
     GROUP_ID NUMBER
 );
 
- begin
-        EXECUTE IMMEDIATE 'ALTER TRIGGER TRG_CHECK_STUDENT_ID DISABLE';
-    end;
 CREATE OR REPLACE PROCEDURE RestoreStudents(p_restore_date TIMESTAMP) IS
 BEGIN
-    begin
-        EXECUTE IMMEDIATE 'ALTER TRIGGER TRG_CHECK_STUDENT_ID DISABLE';
-    end;
-    -- Временная таблица для хранения текущего состояния STUDENTS
+    -- Отключаем триггеры, которые могут мешать восстановлению
+    EXECUTE IMMEDIATE 'ALTER TRIGGER TRG_CHECK_STUDENT_ID DISABLE';
+    EXECUTE IMMEDIATE 'ALTER TRIGGER TRG_CHECK_GROUP_NAME DISABLE';
+    EXECUTE IMMEDIATE 'ALTER TRIGGER TRG_UPDATE_GROUP_COUNT DISABLE';
+
+    -- Очистка таблиц STUDENTS и GROUPS
+    DELETE FROM STUDENTS;
+    DELETE FROM GROUPS;
+
+    -- Восстановление групп из GROUPS_AUDIT
     FOR rec IN (
-        SELECT ID, NAME, GROUP_ID
-        FROM STUDENTS
+        SELECT *
+        FROM GROUPS_AUDIT
+        WHERE ACTION_TIMESTAMP <= p_restore_date
+        ORDER BY ACTION_TIMESTAMP
     ) LOOP
-        INSERT INTO STUDENTS_BACKUP (ID, NAME, GROUP_ID)
-        VALUES (rec.ID, rec.NAME, rec.GROUP_ID);
+        IF rec.ACTION = 'INSERT' THEN
+            -- Вставка новой группы
+            BEGIN
+                INSERT INTO GROUPS (ID, NAME, C_VAL)
+                VALUES (rec.GROUP_ID, rec.NEW_NAME, rec.NEW_C_VAL);
+            EXCEPTION
+                WHEN DUP_VAL_ON_INDEX THEN
+                    -- Если группа уже существует, обновляем её
+                    UPDATE GROUPS
+                    SET NAME = rec.NEW_NAME, C_VAL = rec.NEW_C_VAL
+                    WHERE ID = rec.GROUP_ID;
+            END;
+        ELSIF rec.ACTION = 'UPDATE' THEN
+            -- Обновление существующей группы
+            UPDATE GROUPS
+            SET NAME = rec.NEW_NAME, C_VAL = rec.NEW_C_VAL
+            WHERE ID = rec.GROUP_ID;
+        ELSIF rec.ACTION = 'DELETE' THEN
+            -- Удаление группы
+            DELETE FROM GROUPS WHERE ID = rec.GROUP_ID;
+        END IF;
     END LOOP;
 
-    -- Очистка таблицы STUDENTS
-    DELETE FROM STUDENTS;
-
-    -- Восстановление данных из STUDENTS_AUDIT
+    -- Восстановление студентов из STUDENTS_AUDIT
     FOR rec IN (
         SELECT *
         FROM STUDENTS_AUDIT
@@ -138,42 +175,46 @@ BEGIN
         ORDER BY ACTION_TIMESTAMP
     ) LOOP
         IF rec.ACTION = 'INSERT' THEN
-            -- Вставка новой записи
+            -- Вставка нового студента
             BEGIN
                 INSERT INTO STUDENTS (ID, NAME, GROUP_ID)
                 VALUES (rec.STUDENT_ID, rec.NEW_NAME, rec.NEW_GROUP_ID);
             EXCEPTION
                 WHEN DUP_VAL_ON_INDEX THEN
-                    -- Если запись уже существует, обновляем её
+                    -- Если студент уже существует, обновляем его
                     UPDATE STUDENTS
                     SET NAME = rec.NEW_NAME, GROUP_ID = rec.NEW_GROUP_ID
                     WHERE ID = rec.STUDENT_ID;
             END;
         ELSIF rec.ACTION = 'UPDATE' THEN
-            -- Обновление существующей записи
+            -- Обновление существующего студента
             UPDATE STUDENTS
             SET NAME = rec.NEW_NAME, GROUP_ID = rec.NEW_GROUP_ID
             WHERE ID = rec.STUDENT_ID;
         ELSIF rec.ACTION = 'DELETE' THEN
-            -- Удаление записи
+            -- Удаление студента
             DELETE FROM STUDENTS WHERE ID = rec.STUDENT_ID;
         END IF;
     END LOOP;
+
+    -- Включаем триггеры обратно
     EXECUTE IMMEDIATE 'ALTER TRIGGER TRG_CHECK_STUDENT_ID ENABLE';
+    EXECUTE IMMEDIATE 'ALTER TRIGGER TRG_CHECK_GROUP_NAME ENABLE';
+    EXECUTE IMMEDIATE 'ALTER TRIGGER TRG_UPDATE_GROUP_COUNT ENABLE';
+
     COMMIT;
 EXCEPTION
     WHEN OTHERS THEN
-        -- В случае ошибки откатываем изменения и восстанавливаем данные из резервной копии
+        -- В случае ошибки включаем триггеры и откатываем изменения
         EXECUTE IMMEDIATE 'ALTER TRIGGER TRG_CHECK_STUDENT_ID ENABLE';
+        EXECUTE IMMEDIATE 'ALTER TRIGGER TRG_CHECK_GROUP_NAME ENABLE';
+        EXECUTE IMMEDIATE 'ALTER TRIGGER TRG_UPDATE_GROUP_COUNT ENABLE';
         ROLLBACK;
-        INSERT INTO STUDENTS SELECT * FROM STUDENTS_BACKUP;
-        DELETE FROM STUDENTS_BACKUP;
-        COMMIT;
         RAISE; -- Повторно выбрасываем исключение
 END;
 
 BEGIN
-    RestoreStudents(TIMESTAMP '2025-03-03 14:59:09.091967');
+    RestoreStudents(TIMESTAMP '2025-03-03 16:37:16.146811');
 end;
 
 
@@ -194,14 +235,25 @@ BEGIN
     END IF;
 END;
 
+CREATE TABLE GROUPS_AUDIT (
+    ACTION VARCHAR2(10),
+    GROUP_ID NUMBER,
+    ACTION_TIMESTAMP TIMESTAMP,
+    OLD_NAME VARCHAR2(100),
+    NEW_NAME VARCHAR2(100),
+    OLD_C_VAL NUMBER,
+    NEW_C_VAL NUMBER
+);
+
 
 SELECT * FROM USER_TRIGGERS;
 
 INSERT INTO GROUPS (NAME) VALUES ('русские');
 INSERT INTO GROUPS (NAME) VALUES ('нерусские');
 
-INSERT INTO STUDENTS (ID, NAME, GROUP_ID) VALUES (5, 'женя', 3);
-INSERT INTO STUDENTS (ID, NAME, GROUP_ID) VALUES (12, 'махачкала1', 2);
+INSERT INTO STUDENTS (ID, NAME, GROUP_ID) VALUES (5, 'женя', 1);
+INSERT INTO STUDENTS (ID, NAME, GROUP_ID) VALUES (6, 'женя1', 1);
+INSERT INTO STUDENTS (ID, NAME, GROUP_ID) VALUES (10, 'махачкала', 2);
 
 SELECT * FROM GROUPS;
 SELECT * FROM STUDENTS;
