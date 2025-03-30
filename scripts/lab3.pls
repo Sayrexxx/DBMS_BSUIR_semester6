@@ -1,8 +1,13 @@
 CREATE OR REPLACE PROCEDURE compare_schemas(
     dev_schema_name IN VARCHAR2,
     prod_schema_name IN VARCHAR2
-) IS
+)   AUTHID CURRENT_USER
+IS
     v_diff_count NUMBER;
+    TYPE t_varchar_table IS TABLE OF VARCHAR2(128);
+    v_dev_ddl        CLOB;
+    v_prod_ddl       CLOB;
+
     CURSOR c_missing_tables IS
         SELECT table_name
         FROM all_tables
@@ -95,6 +100,29 @@ CREATE OR REPLACE PROCEDURE compare_schemas(
             DBMS_OUTPUT.PUT_LINE('    - Error checking dependencies: ' || SQLERRM);
     END check_circular_deps;
 
+
+    FUNCTION normalize_ddl(p_ddl IN CLOB) RETURN CLOB IS
+    v_normalized CLOB;
+    BEGIN
+        v_normalized := p_ddl;
+        v_normalized := REPLACE(v_normalized, CHR(10), ' ');
+        v_normalized := REPLACE(v_normalized, CHR(13), ' ');
+        v_normalized := REGEXP_REPLACE(v_normalized, '\s+', ' ');
+        v_normalized := TRIM(v_normalized);
+        v_normalized := REGEXP_REPLACE(v_normalized, '"[^"]+"\.', '');
+        v_normalized := REGEXP_REPLACE(v_normalized, 'EDITIONABLE', '');
+        v_normalized := REGEXP_REPLACE(v_normalized, 'END\s+\w+;', 'END;');
+        RETURN v_normalized;
+    EXCEPTION
+        WHEN OTHERS THEN
+          RETURN p_ddl;
+    END normalize_ddl;
+
+    FUNCTION replace_schema(p_ddl IN CLOB) RETURN CLOB IS
+    BEGIN
+        RETURN REPLACE(p_ddl, '"' || UPPER(dev_schema_name) || '"', '"' || UPPER(prod_schema_name) || '"');
+    END replace_schema;
+
 BEGIN
     DBMS_OUTPUT.PUT_LINE('Starting schema comparison between DEV (' || dev_schema_name || ') and PROD (' || prod_schema_name || ')');
     DBMS_OUTPUT.PUT_LINE('==================================================================');
@@ -138,9 +166,216 @@ BEGIN
         END IF;
     END LOOP;
 
-    DBMS_OUTPUT.PUT_LINE('Step 3: Checking for circular dependencies...');
+    DBMS_OUTPUT.PUT_LINE('Step 3: Checking for missing procedures in PROD schema...');
+    BEGIN
+        FOR obj IN (SELECT OBJECT_NAME
+                FROM ALL_OBJECTS
+                WHERE owner = 'C##DEV_SCHEMA1' and OBJECT_TYPE = 'PROCEDURE'
+                MINUS
+                SELECT OBJECT_NAME
+                FROM ALL_OBJECTS
+                WHERE owner = 'C##PROD_SCHEMA1' and OBJECT_TYPE = 'PROCEDURE')
+        LOOP DBMS_OUTPUT.PUT_LINE(obj.OBJECT_NAME);
+        END LOOP;
+    END;
+
+    DBMS_OUTPUT.PUT_LINE('Step 4: Checking for missing functions in PROD schema...');
+    BEGIN
+        FOR obj IN (SELECT OBJECT_NAME
+                FROM ALL_OBJECTS
+                WHERE owner = 'C##DEV_SCHEMA1' and OBJECT_TYPE = 'FUNCTION'
+                MINUS
+                SELECT OBJECT_NAME
+                FROM ALL_OBJECTS
+                WHERE owner = 'C##PROD_SCHEMA1' and OBJECT_TYPE = 'FUNCTION')
+        LOOP DBMS_OUTPUT.PUT_LINE(obj.OBJECT_NAME);
+        END LOOP;
+    END;
+
+    DBMS_OUTPUT.PUT_LINE('Step 5: Checking for missing indexes in PROD schema...');
+    BEGIN
+        FOR obj IN (SELECT OBJECT_NAME
+                FROM ALL_OBJECTS
+                WHERE owner = 'C##DEV_SCHEMA1' and OBJECT_TYPE = 'INDEX'
+                MINUS
+                SELECT OBJECT_NAME
+                FROM ALL_OBJECTS
+                WHERE owner = 'C##PROD_SCHEMA1' and OBJECT_TYPE = 'INDEX')
+        LOOP DBMS_OUTPUT.PUT_LINE(obj.OBJECT_NAME);
+        END LOOP;
+    END;
+
+    DBMS_OUTPUT.PUT_LINE('Step 6: Checking for missing packages in PROD schema...');
+    BEGIN
+        FOR obj IN (SELECT OBJECT_NAME
+                FROM ALL_OBJECTS
+                WHERE owner = 'C##DEV_SCHEMA1' and OBJECT_TYPE = 'PACKAGE'
+                MINUS
+                SELECT OBJECT_NAME
+                FROM ALL_OBJECTS
+                WHERE owner = 'C##PROD_SCHEMA1' and OBJECT_TYPE = 'PACKAGE')
+        LOOP DBMS_OUTPUT.PUT_LINE(obj.OBJECT_NAME);
+        END LOOP;
+    END;
+
+    DBMS_OUTPUT.PUT_LINE('Step 7: Checking for circular dependencies...');
     check_circular_deps(dev_schema_name, 'DEV');
     check_circular_deps(prod_schema_name, 'PROD');
+
+    DBMS_OUTPUT.PUT_LINE('Step 8: Scripts to fix differences in schemas:');
+
+    FOR rec IN (SELECT table_name FROM all_tables WHERE owner = UPPER(dev_schema_name))
+    LOOP
+        BEGIN
+          v_dev_ddl := DBMS_METADATA.GET_DDL('TABLE', rec.table_name, UPPER(dev_schema_name));
+        EXCEPTION WHEN OTHERS THEN
+          v_dev_ddl := 'NO DDL';
+        END;
+        BEGIN
+          v_prod_ddl := DBMS_METADATA.GET_DDL('TABLE', rec.table_name, UPPER(prod_schema_name));
+        EXCEPTION WHEN OTHERS THEN
+          v_prod_ddl := 'NO DDL';
+        END;
+        IF v_prod_ddl = 'NO DDL' THEN
+          DBMS_OUTPUT.PUT_LINE(replace_schema(v_dev_ddl) || ';');
+        ELSIF normalize_ddl(v_dev_ddl) <> normalize_ddl(v_prod_ddl) THEN
+          DBMS_OUTPUT.PUT_LINE('DROP TABLE ' || rec.table_name || ' CASCADE CONSTRAINTS;');
+          DBMS_OUTPUT.PUT_LINE(replace_schema(v_dev_ddl) || ';');
+        END IF;
+    END LOOP;
+    FOR rec IN (
+        SELECT table_name FROM all_tables
+        WHERE owner = UPPER(prod_schema_name)
+          AND table_name NOT IN (SELECT table_name FROM all_tables WHERE owner = UPPER(dev_schema_name))
+        )
+        LOOP
+        DBMS_OUTPUT.PUT_LINE('DROP TABLE ' || rec.table_name || ' CASCADE CONSTRAINTS;');
+    END LOOP;
+
+    FOR rec IN (SELECT object_name FROM all_objects
+              WHERE owner = UPPER(dev_schema_name) AND object_type = 'PROCEDURE')
+    LOOP
+        BEGIN
+          v_dev_ddl := DBMS_METADATA.GET_DDL('PROCEDURE', rec.object_name, UPPER(dev_schema_name));
+        EXCEPTION WHEN OTHERS THEN
+          v_dev_ddl := 'NO DDL';
+        END;
+        BEGIN
+          v_prod_ddl := DBMS_METADATA.GET_DDL('PROCEDURE', rec.object_name, UPPER(prod_schema_name));
+        EXCEPTION WHEN OTHERS THEN
+          v_prod_ddl := 'NO DDL';
+        END;
+        IF v_prod_ddl = 'NO DDL' THEN
+          DBMS_OUTPUT.PUT_LINE(replace_schema(v_dev_ddl) || ';');
+        ELSIF normalize_ddl(v_dev_ddl) <> normalize_ddl(v_prod_ddl) THEN
+          DBMS_OUTPUT.PUT_LINE('DROP PROCEDURE ' || rec.object_name || ';');
+          DBMS_OUTPUT.PUT_LINE(replace_schema(v_dev_ddl) || ';');
+        END IF;
+    END LOOP;
+    FOR rec IN (
+        SELECT object_name FROM all_objects
+        WHERE owner = UPPER(prod_schema_name) AND object_type = 'PROCEDURE'
+          AND object_name NOT IN (
+            SELECT object_name FROM all_objects
+            WHERE owner = UPPER(dev_schema_name) AND object_type = 'PROCEDURE'
+          )
+       )
+       LOOP DBMS_OUTPUT.PUT_LINE('DROP PROCEDURE ' || rec.object_name || ';');
+    END LOOP;
+
+    FOR rec IN (SELECT object_name FROM all_objects
+              WHERE owner = UPPER(dev_schema_name) AND object_type = 'FUNCTION')
+    LOOP
+        BEGIN
+          v_dev_ddl := DBMS_METADATA.GET_DDL('FUNCTION', rec.object_name, UPPER(dev_schema_name));
+        EXCEPTION WHEN OTHERS THEN
+          v_dev_ddl := 'NO DDL';
+        END;
+        BEGIN
+          v_prod_ddl := DBMS_METADATA.GET_DDL('FUNCTION', rec.object_name, UPPER(prod_schema_name));
+        EXCEPTION WHEN OTHERS THEN
+          v_prod_ddl := 'NO DDL';
+        END;
+        IF v_prod_ddl = 'NO DDL' THEN
+          DBMS_OUTPUT.PUT_LINE(replace_schema(v_dev_ddl) || ';');
+        ELSIF normalize_ddl(v_dev_ddl) <> normalize_ddl(v_prod_ddl) THEN
+          DBMS_OUTPUT.PUT_LINE('DROP FUNCTION ' || rec.object_name || ';');
+          DBMS_OUTPUT.PUT_LINE(replace_schema(v_dev_ddl) || ';');
+        END IF;
+    END LOOP;
+    FOR rec IN (
+        SELECT object_name FROM all_objects
+        WHERE owner = UPPER(prod_schema_name) AND object_type = 'FUNCTION'
+            AND object_name NOT IN (
+                SELECT object_name FROM all_objects
+                WHERE owner = UPPER(dev_schema_name) AND object_type = 'FUNCTION'
+            )
+        )
+        LOOP DBMS_OUTPUT.PUT_LINE('DROP FUNCTION ' || rec.object_name || ';');
+    END LOOP;
+
+    FOR rec IN (SELECT object_name FROM all_objects
+              WHERE owner = UPPER(dev_schema_name) AND object_type = 'PACKAGE')
+    LOOP
+        BEGIN
+          v_dev_ddl := DBMS_METADATA.GET_DDL('PACKAGE', rec.object_name, UPPER(dev_schema_name));
+        EXCEPTION WHEN OTHERS THEN
+          v_dev_ddl := 'NO DDL';
+        END;
+        BEGIN
+          v_prod_ddl := DBMS_METADATA.GET_DDL('PACKAGE', rec.object_name, UPPER(prod_schema_name));
+        EXCEPTION WHEN OTHERS THEN
+          v_prod_ddl := 'NO DDL';
+        END;
+        IF v_prod_ddl = 'NO DDL' THEN
+          DBMS_OUTPUT.PUT_LINE(replace_schema(v_dev_ddl) || ';');
+        ELSIF normalize_ddl(v_dev_ddl) <> normalize_ddl(v_prod_ddl) THEN
+          DBMS_OUTPUT.PUT_LINE('DROP PACKAGE ' || rec.object_name || ';');
+          DBMS_OUTPUT.PUT_LINE(replace_schema(v_dev_ddl) || ';');
+        END IF;
+    END LOOP;
+    FOR rec IN (
+        SELECT object_name FROM all_objects
+        WHERE owner = UPPER(prod_schema_name) AND object_type = 'PACKAGE'
+          AND object_name NOT IN (
+            SELECT object_name FROM all_objects
+            WHERE owner = UPPER(dev_schema_name) AND object_type = 'PACKAGE'
+          )
+        )
+        LOOP DBMS_OUTPUT.PUT_LINE('DROP PACKAGE ' || rec.object_name || ';');
+    END LOOP;
+
+    FOR rec IN (SELECT index_name FROM all_indexes
+              WHERE owner = UPPER(dev_schema_name) AND index_name NOT LIKE 'SYS_%')
+    LOOP
+        BEGIN
+          v_dev_ddl := DBMS_METADATA.GET_DDL('INDEX', rec.index_name, UPPER(dev_schema_name));
+        EXCEPTION WHEN OTHERS THEN
+          v_dev_ddl := 'NO DDL';
+        END;
+        BEGIN
+          v_prod_ddl := DBMS_METADATA.GET_DDL('INDEX', rec.index_name, UPPER(prod_schema_name));
+        EXCEPTION WHEN OTHERS THEN
+          v_prod_ddl := 'NO DDL';
+        END;
+        IF v_prod_ddl = 'NO DDL' THEN
+          DBMS_OUTPUT.PUT_LINE(replace_schema(v_dev_ddl) || ';');
+        ELSIF normalize_ddl(v_dev_ddl) <> normalize_ddl(v_prod_ddl) THEN
+          DBMS_OUTPUT.PUT_LINE('DROP INDEX ' || rec.index_name || ';');
+          DBMS_OUTPUT.PUT_LINE(replace_schema(v_dev_ddl) || ';');
+        END IF;
+    END LOOP;
+    FOR rec IN (
+        SELECT index_name FROM all_indexes
+        WHERE owner = UPPER(prod_schema_name) AND index_name NOT LIKE 'SYS_%'
+          AND index_name NOT IN (
+            SELECT index_name FROM all_indexes
+            WHERE owner = UPPER(dev_schema_name) AND index_name NOT LIKE 'SYS_%'
+          )
+        )
+    LOOP
+        DBMS_OUTPUT.PUT_LINE('DROP INDEX ' || rec.index_name || ';');
+    END LOOP;
 
     DBMS_OUTPUT.PUT_LINE('Schema comparison completed.');
     DBMS_OUTPUT.PUT_LINE('==================================================================');
