@@ -4,9 +4,25 @@ CREATE OR REPLACE PROCEDURE compare_schemas(
 )   AUTHID CURRENT_USER
 IS
     v_diff_count NUMBER;
-    TYPE t_varchar_table IS TABLE OF VARCHAR2(128);
     v_dev_ddl        CLOB;
     v_prod_ddl       CLOB;
+    v_count          NUMBER;
+    v_table_name     VARCHAR2(128);
+
+    TYPE t_varchar_table IS TABLE OF VARCHAR2(128);
+    v_affected_tables t_varchar_table := t_varchar_table();
+
+    TYPE t_issue_map IS TABLE OF VARCHAR2(10) INDEX BY VARCHAR2(128);
+    v_issue_map t_issue_map;
+
+    TYPE t_dep_count_map IS TABLE OF NUMBER INDEX BY VARCHAR2(128);
+    v_dep_count t_dep_count_map;
+
+    TYPE t_children_map IS TABLE OF t_varchar_table INDEX BY VARCHAR2(128);
+    v_children t_children_map;
+
+    v_sorted         t_varchar_table := t_varchar_table();
+    v_sorted_count   PLS_INTEGER := 0;
 
     CURSOR c_missing_tables IS
         SELECT table_name
@@ -99,6 +115,115 @@ IS
         WHEN OTHERS THEN
             DBMS_OUTPUT.PUT_LINE('    - Error checking dependencies: ' || SQLERRM);
     END check_circular_deps;
+
+    PROCEDURE check_cycles(
+    p_schema_name IN VARCHAR2,
+    p_schema_label IN VARCHAR2
+) IS
+    TYPE t_table_list IS TABLE OF VARCHAR2(128);
+    v_path        t_table_list := t_table_list(); -- Текущий путь
+    v_visited     t_table_list := t_table_list(); -- Таблицы, которые уже проверены
+    v_has_cycle   BOOLEAN := FALSE;
+
+    -- Курсор для получения списка всех таблиц схемы
+    CURSOR table_cursor IS
+        SELECT object_name
+        FROM all_objects
+        WHERE object_type = 'TABLE'
+          AND owner = p_schema_name
+        ORDER BY created; -- Сортировка по времени создания таблиц
+
+    -- Функция для проверки наличия таблицы в списке
+    FUNCTION is_in_list(tbl_name VARCHAR2, lst t_table_list) RETURN BOOLEAN IS
+    BEGIN
+        FOR i IN 1 .. lst.COUNT LOOP
+            IF lst(i) = tbl_name THEN
+                RETURN TRUE;
+            END IF;
+        END LOOP;
+        RETURN FALSE;
+    END is_in_list;
+
+    -- Рекурсивная процедура для проверки циклов
+    PROCEDURE explore(v_table VARCHAR2) IS
+        v_cycle_start NUMBER := 0;
+        v_cycle_path  VARCHAR2(4000);
+        v_parent_list t_table_list;
+    BEGIN
+        -- Проверяем, есть ли таблица в текущем пути (обнаружение цикла)
+        FOR i IN 1 .. v_path.COUNT LOOP
+            IF v_path(i) = v_table THEN
+                v_cycle_start := i;
+                EXIT;
+            END IF;
+        END LOOP;
+
+        -- Если цикл найден
+        IF v_cycle_start > 0 THEN
+            v_has_cycle := TRUE;
+            v_cycle_path := v_path(v_cycle_start);
+            FOR j IN v_cycle_start+1 .. v_path.COUNT LOOP
+                v_cycle_path := v_cycle_path || ' -> ' || v_path(j);
+            END LOOP;
+            v_cycle_path := v_cycle_path || ' -> ' || v_table;
+
+            DBMS_OUTPUT.PUT_LINE('    - ERROR: Circular dependency detected: ' || v_cycle_path);
+            RETURN;
+        END IF;
+
+        -- Проверяем, посещали ли уже эту таблицу
+        IF is_in_list(v_table, v_visited) THEN
+            RETURN;
+        END IF;
+
+        -- Добавляем таблицу в текущий путь и в список посещённых
+        v_path.EXTEND;
+        v_path(v_path.LAST) := v_table;
+        v_visited.EXTEND;
+        v_visited(v_visited.LAST) := v_table;
+
+        -- Получаем родительские таблицы через внешние ключи
+        SELECT b.table_name BULK COLLECT INTO v_parent_list
+        FROM all_constraints a
+        JOIN all_constraints b ON a.r_constraint_name = b.constraint_name
+        WHERE a.owner = p_schema_name AND a.constraint_type = 'R'
+          AND a.table_name = v_table
+        ORDER BY a.last_change;
+
+        -- Рекурсивно проверяем родительские таблицы
+        FOR i IN 1 .. v_parent_list.COUNT LOOP
+            explore(v_parent_list(i));
+        END LOOP;
+
+        -- Убираем текущую таблицу из пути после рекурсии
+        v_path.DELETE(v_path.LAST);
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            NULL; -- Если у таблицы нет родителей, ничего не делаем
+        WHEN OTHERS THEN
+            DBMS_OUTPUT.PUT_LINE('    - Error in explore(' || v_table || '): ' || SQLERRM);
+    END explore;
+BEGIN
+    DBMS_OUTPUT.PUT_LINE('Step 8: Checking for complex circular dependencies...');
+    DBMS_OUTPUT.PUT_LINE('  Checking ' || p_schema_label || ' schema...');
+
+    -- Проходим по всем таблицам схемы
+    FOR rec IN table_cursor LOOP
+        IF NOT is_in_list(rec.object_name, v_visited) THEN
+            DBMS_OUTPUT.PUT_LINE('  Starting cycle check from: ' || rec.object_name);
+            explore(rec.object_name);
+        END IF;
+    END LOOP;
+
+    -- Если циклов нет
+    IF NOT v_has_cycle THEN
+        DBMS_OUTPUT.PUT_LINE('    - No circular dependencies found.');
+    END IF;
+EXCEPTION
+    WHEN OTHERS THEN
+        DBMS_OUTPUT.PUT_LINE('    - Error checking dependencies: ' || SQLERRM);
+END check_cycles;
+
 
 
     FUNCTION normalize_ddl(p_ddl IN CLOB) RETURN CLOB IS
@@ -218,11 +343,142 @@ BEGIN
         END LOOP;
     END;
 
+
     DBMS_OUTPUT.PUT_LINE('Step 7: Checking for circular dependencies...');
     check_circular_deps(dev_schema_name, 'DEV');
     check_circular_deps(prod_schema_name, 'PROD');
 
-    DBMS_OUTPUT.PUT_LINE('Step 8: Scripts to fix differences in schemas:');
+    DBMS_OUTPUT.PUT_LINE('Step 8: Checking for complex circular dependencies...');
+
+    FOR rec IN (
+    SELECT dt.table_name,
+           CASE
+             WHEN pt.table_name IS NULL THEN 'MISSING'
+             WHEN (SELECT COUNT(*) FROM (
+                      SELECT column_name, data_type, data_length, nullable
+                      FROM all_tab_columns
+                      WHERE owner = UPPER(dev_schema_name)
+                        AND table_name = dt.table_name
+                      MINUS
+                      SELECT column_name, data_type, data_length, nullable
+                      FROM all_tab_columns
+                      WHERE owner = UPPER(prod_schema_name)
+                        AND table_name = dt.table_name
+                   )) > 0 THEN 'DIFF'
+           END AS issue
+    FROM (SELECT table_name FROM all_tables WHERE owner = UPPER(dev_schema_name)) dt
+    LEFT JOIN (SELECT table_name FROM all_tables WHERE owner = UPPER(prod_schema_name)) pt
+      ON dt.table_name = pt.table_name
+    WHERE pt.table_name IS NULL OR
+          ((SELECT COUNT(*) FROM (
+              SELECT column_name, data_type, data_length, nullable
+              FROM all_tab_columns
+              WHERE owner = UPPER(dev_schema_name)
+                AND table_name = dt.table_name
+              MINUS
+              SELECT column_name, data_type, data_length, nullable
+              FROM all_tab_columns
+              WHERE owner = UPPER(prod_schema_name)
+                AND table_name = dt.table_name
+            )) > 0)
+  ) LOOP
+    v_affected_tables.EXTEND;
+    v_affected_tables(v_affected_tables.COUNT) := rec.table_name;
+    v_issue_map(rec.table_name) := rec.issue;
+  END LOOP;
+
+  FOR i IN 1 .. v_affected_tables.COUNT LOOP
+    v_dep_count(v_affected_tables(i)) := 0;
+    v_children(v_affected_tables(i)) := t_varchar_table();
+  END LOOP;
+
+  FOR i IN 1 .. v_affected_tables.COUNT LOOP
+    v_table_name := v_affected_tables(i);
+    SELECT COUNT(*) INTO v_count
+    FROM all_tables
+    WHERE owner = UPPER(prod_schema_name)
+      AND table_name = v_table_name;
+    DECLARE
+      v_schema_for_fk VARCHAR2(30);
+    BEGIN
+      IF v_count > 0 THEN
+        v_schema_for_fk := UPPER(prod_schema_name);
+      ELSE
+        v_schema_for_fk := UPPER(dev_schema_name);
+      END IF;
+      FOR fk_rec IN (
+        SELECT a.table_name AS child, c.table_name AS parent
+        FROM all_constraints a
+        JOIN all_constraints c ON a.r_constraint_name = c.constraint_name AND a.owner = c.owner
+        WHERE a.constraint_type = 'R'
+          AND a.owner = v_schema_for_fk
+          AND a.table_name = v_table_name
+      ) LOOP
+        FOR j IN 1 .. v_affected_tables.COUNT LOOP
+          IF fk_rec.parent = v_affected_tables(j) THEN
+            v_dep_count(v_table_name) := v_dep_count(v_table_name) + 1;
+            v_children(fk_rec.parent).EXTEND;
+            v_children(fk_rec.parent)(v_children(fk_rec.parent).COUNT) := v_table_name;
+          END IF;
+        END LOOP;
+      END LOOP;
+    END;
+  END LOOP;
+
+  DECLARE
+    TYPE t_queue IS TABLE OF VARCHAR2(128);
+    v_queue t_queue := t_queue();
+    v_queue_start PLS_INTEGER := 1;
+    v_queue_end   PLS_INTEGER := 0;
+  BEGIN
+    FOR i IN 1 .. v_affected_tables.COUNT LOOP
+      IF v_dep_count(v_affected_tables(i)) = 0 THEN
+        v_queue_end := v_queue_end + 1;
+        v_queue.EXTEND;
+        v_queue(v_queue_end) := v_affected_tables(i);
+      END IF;
+    END LOOP;
+    WHILE v_queue_start <= v_queue_end LOOP
+      DECLARE
+        v_current VARCHAR2(128);
+      BEGIN
+        v_current := v_queue(v_queue_start);
+        v_queue_start := v_queue_start + 1;
+        v_sorted_count := v_sorted_count + 1;
+        v_sorted.EXTEND;
+        v_sorted(v_sorted_count) := v_current;
+        FOR i IN 1 .. v_children(v_current).COUNT LOOP
+          DECLARE
+            v_child VARCHAR2(128) := v_children(v_current)(i);
+          BEGIN
+            v_dep_count(v_child) := v_dep_count(v_child) - 1;
+            IF v_dep_count(v_child) = 0 THEN
+              v_queue_end := v_queue_end + 1;
+              v_queue.EXTEND;
+              v_queue(v_queue_end) := v_child;
+            END IF;
+          END;
+        END LOOP;
+      END;
+    END LOOP;
+    IF v_sorted_count < v_affected_tables.COUNT THEN
+      FOR i IN 1 .. v_affected_tables.COUNT LOOP
+        IF v_dep_count(v_affected_tables(i)) > 0 THEN
+          v_sorted_count := v_sorted_count + 1;
+          v_sorted.EXTEND;
+          v_sorted(v_sorted_count) := v_affected_tables(i);
+        END IF;
+      END LOOP;
+    END IF;
+  END;
+
+  DBMS_OUTPUT.PUT_LINE('Перечень таблиц (либо отсутствуют в PROD, либо отличаются по структуре),');
+  DBMS_OUTPUT.PUT_LINE('отсортированные по порядку создания:');
+  FOR i IN 1 .. v_sorted_count LOOP
+    DBMS_OUTPUT.PUT_LINE('  ' || v_sorted(i));
+  END LOOP;
+
+    DBMS_OUTPUT.PUT_LINE('Step 9: Scripts to fix differences in schemas:');
 
     FOR rec IN (SELECT table_name FROM all_tables WHERE owner = UPPER(dev_schema_name))
     LOOP
@@ -453,3 +709,49 @@ EXCEPTION
             RAISE;
         END IF;
 END;
+
+
+CREATE PROCEDURE test1
+IS
+BEGIN
+    SELECT * from orders;
+end;
+
+
+CREATE OR REPLACE PROCEDURE test1
+IS
+BEGIN
+    SELECT * from products;
+end;
+
+
+ALTER SESSION SET CURRENT_SCHEMA = C##DEV_SCHEMA1;
+
+
+CREATE TABLE T1 (
+    id NUMBER PRIMARY KEY,
+    val NUMBER,
+    t3_id NUMBER
+);
+
+CREATE TABLE T2 (
+    id NUMBER PRIMARY KEY,
+    val NUMBER,
+    t1_id NUMBER
+);
+
+CREATE TABLE T3 (
+    id NUMBER PRIMARY KEY,
+    val NUMBER,
+    t2_id NUMBER
+);
+
+ALTER TABLE T1 ADD CONSTRAINT fk_t1_t3 FOREIGN KEY (t3_id) REFERENCES t3(id);
+ALTER TABLE T3 ADD CONSTRAINT fk_t3_t2 FOREIGN KEY (t2_id) REFERENCES t2(id);
+ALTER TABLE T2 ADD CONSTRAINT fk_t2_t1 FOREIGN KEY (t1_id) REFERENCES t1(id);
+
+
+drop table t1;
+drop table t2;
+drop table t3;
+
